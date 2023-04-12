@@ -44,6 +44,7 @@ pub struct ReleaseListBuilder {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: Option<String>,
+    download_url: Option<String>,
 }
 
 impl ReleaseListBuilder {
@@ -89,6 +90,7 @@ impl ReleaseListBuilder {
             region: self.region.clone(),
             asset_prefix: self.asset_prefix.clone(),
             target: self.target.clone(),
+            download_url: self.download_url.clone(),
         })
     }
 }
@@ -102,6 +104,7 @@ pub struct ReleaseList {
     asset_prefix: Option<String>,
     target: Option<String>,
     region: Option<String>,
+    download_url: Option<String>,
 }
 
 impl ReleaseList {
@@ -113,6 +116,7 @@ impl ReleaseList {
             asset_prefix: None,
             target: None,
             region: None,
+            download_url: None,
         }
     }
 
@@ -124,6 +128,7 @@ impl ReleaseList {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.download_url,
         )?;
         let releases = match self.target {
             None => releases,
@@ -138,8 +143,7 @@ impl ReleaseList {
 
 /// `s3::Update` builder
 ///
-/// Configure download and installation from
-/// `https://<bucket_name>.s3.<region>.amazonaws.com/<asset filename>`
+/// Configure download and installation from s3 or object storage service.
 #[derive(Debug)]
 pub struct UpdateBuilder {
     end_point: EndPoint,
@@ -158,6 +162,7 @@ pub struct UpdateBuilder {
     progress_template: String,
     progress_chars: String,
     auth_token: Option<String>,
+    download_url: Option<String>,
 }
 
 impl Default for UpdateBuilder {
@@ -179,6 +184,7 @@ impl Default for UpdateBuilder {
             progress_template: DEFAULT_PROGRESS_TEMPLATE.to_string(),
             progress_chars: DEFAULT_PROGRESS_CHARS.to_string(),
             auth_token: None,
+            download_url: None,
         }
     }
 }
@@ -371,6 +377,7 @@ impl UpdateBuilder {
             show_output: self.show_output,
             no_confirm: self.no_confirm,
             auth_token: self.auth_token.clone(),
+            download_url: self.download_url.clone(),
         }))
     }
 }
@@ -394,6 +401,7 @@ pub struct Update {
     progress_template: String,
     progress_chars: String,
     auth_token: Option<String>,
+    download_url: Option<String>,
 }
 
 impl Update {
@@ -410,6 +418,7 @@ impl ReleaseUpdate for Update {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.download_url,
         )?;
         let rel = releases
             .iter()
@@ -439,6 +448,7 @@ impl ReleaseUpdate for Update {
             &self.bucket_name,
             &self.region,
             &self.asset_prefix,
+            &self.download_url,
         )?;
         let rel = releases.iter().find(|x| x.version == ver);
         match rel {
@@ -509,6 +519,7 @@ fn fetch_releases_from_s3(
     bucket_name: &str,
     region: &Option<String>,
     asset_prefix: &Option<String>,
+    download_url: &Option<String>,
 ) -> Result<Vec<Release>> {
     let prefix = match asset_prefix {
         Some(prefix) => format!("&prefix={}", prefix),
@@ -519,17 +530,21 @@ fn fetch_releases_from_s3(
         .as_ref()
         .ok_or_else(|| Error::Config("`region` required".to_string()));
 
-    let download_base_url = match end_point {
-        EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region?),
-        EndPoint::S3DualStack => format!(
-            "https://{}.s3.dualstack.{}.amazonaws.com/",
-            bucket_name, region?
-        ),
-        EndPoint::DigitalOceanSpaces => format!(
-            "https://{}.{}.digitaloceanspaces.com/",
-            bucket_name, region?
-        ),
-        EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
+    let download_base_url = if let Some(download_url) = download_url {
+        download_url.to_string()
+    } else {
+        match end_point {
+            EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region?),
+            EndPoint::S3DualStack => format!(
+                "https://{}.s3.dualstack.{}.amazonaws.com/",
+                bucket_name, region?
+            ),
+            EndPoint::DigitalOceanSpaces => format!(
+                "https://{}.{}.digitaloceanspaces.com/",
+                bucket_name, region?
+            ),
+            EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
+        }
     };
 
     let api_url = match end_point {
