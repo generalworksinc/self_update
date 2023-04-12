@@ -335,6 +335,12 @@ impl UpdateBuilder {
         self
     }
 
+    /// Set the custmize download url
+    pub fn download_url(&mut self, download_url: &str) -> &mut Self {
+        self.download_url = Some(download_url.to_owned());
+        self
+    }
+    
     /// Confirm config and create a ready-to-use `Update`
     ///
     /// * Errors:
