@@ -72,6 +72,12 @@ impl ReleaseListBuilder {
         self
     }
 
+    /// Set the custmize download url
+    pub fn download_url(&mut self, download_url: &str) -> &mut Self {
+        self.download_url = Some(download_url.to_owned());
+        self
+    }
+
     /// Set the optional arch `target` name, used to filter available releases
     pub fn with_target(&mut self, target: &str) -> &mut Self {
         self.target = Some(target.to_owned());
