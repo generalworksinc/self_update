@@ -16,7 +16,8 @@ use std::env::{self, consts::EXE_SUFFIX};
 use std::path::{Path, PathBuf};
 
 /// Maximum number of items to retrieve from S3 API
-const MAX_KEYS: u8 = 100;
+const MAX_KEYS: u16 = 1000;
+// const MAX_KEYS: u8 = 100;
 
 /// The service end point.
 ///
@@ -533,144 +534,160 @@ fn fetch_releases_from_s3(
     asset_prefix: &Option<String>,
     download_url: &Option<String>,
 ) -> Result<Vec<Release>> {
-    let prefix = match asset_prefix {
-        Some(prefix) => format!("&prefix={}", prefix),
-        None => "".to_string(),
-    };
 
-    let region = region
-        .as_ref()
-        .ok_or_else(|| Error::Config("`region` required".to_string()));
+    let mut all_releases: Vec<crate::update::Release> = Vec::new();
+    let mut next_token: Option<String> = Some(String::new());
+    while let Some(token) = next_token {
+        next_token = None;
+        let prefix = match asset_prefix {
+            Some(prefix) => format!("&prefix={}", prefix),
+            None => "".to_string(),
+        };
 
-    let download_base_url = if let Some(download_url) = download_url {
-        download_url.to_string()
-    } else {
-        match end_point {
-            EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region?),
-            EndPoint::S3DualStack => format!(
-                "https://{}.s3.dualstack.{}.amazonaws.com/",
-                bucket_name, region?
+        let region = region
+            .as_ref()
+            .ok_or_else(|| Error::Config("`region` required".to_string()));
+
+        let download_base_url = if let Some(download_url) = download_url {
+            download_url.to_string()
+        } else {
+            match end_point {
+                EndPoint::S3 => format!("https://{}.s3.{}.amazonaws.com/", bucket_name, region?),
+                EndPoint::S3DualStack => format!(
+                    "https://{}.s3.dualstack.{}.amazonaws.com/",
+                    bucket_name, region?
+                ),
+                EndPoint::DigitalOceanSpaces => format!(
+                    "https://{}.{}.digitaloceanspaces.com/",
+                    bucket_name, region?
+                ),
+                EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
+            }
+        };
+
+        let api_url = match end_point {
+            EndPoint::S3 | EndPoint::S3DualStack | EndPoint::DigitalOceanSpaces => format!(
+                "{}?list-type=2&max-keys={}{}{}",
+                download_base_url, MAX_KEYS, prefix, if token=="" { "".to_string() } else { format!("&continuation-token={}", urlencoding::encode(&token).as_ref()) }
             ),
-            EndPoint::DigitalOceanSpaces => format!(
-                "https://{}.{}.digitaloceanspaces.com/",
-                bucket_name, region?
-            ),
-            EndPoint::GCS => format!("https://storage.googleapis.com/{}/", bucket_name),
+            EndPoint::GCS => format!("{}?max-keys={}{}", download_base_url, MAX_KEYS, prefix),
+        };
+
+        debug!("using api url: {:?}", api_url);
+
+        let resp = reqwest::blocking::Client::new().get(&api_url).send()?;
+        if !resp.status().is_success() {
+            bail!(
+                Error::Network,
+                "S3 API request failed with status: {:?} - for: {:?}",
+                resp.status(),
+                api_url
+            )
         }
-    };
 
-    let api_url = match end_point {
-        EndPoint::S3 | EndPoint::S3DualStack | EndPoint::DigitalOceanSpaces => format!(
-            "{}?list-type=2&max-keys={}{}",
-            download_base_url, MAX_KEYS, prefix
-        ),
-        EndPoint::GCS => format!("{}?max-keys={}{}", download_base_url, MAX_KEYS, prefix),
-    };
+        let body = resp.text()?;
+        let mut reader = Reader::from_str(&body);
+        reader.trim_text(true);
 
-    debug!("using api url: {:?}", api_url);
+        // Let's now parse the response to extract the releases
+        enum Tag {
+            Contents,
+            Key,
+            LastModified,
+            Other,
+            NextContinuationToken,
+        }
 
-    let resp = reqwest::blocking::Client::new().get(&api_url).send()?;
-    if !resp.status().is_success() {
-        bail!(
-            Error::Network,
-            "S3 API request failed with status: {:?} - for: {:?}",
-            resp.status(),
-            api_url
-        )
-    }
+        let mut current_tag = Tag::Other;
+        let mut current_release: Option<Release> = None;
+        let regex =
+            Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
+                .map_err(|err| {
+                    Error::Release(format!(
+                        "Failed constructing regex to parse S3 filenames: {}",
+                        err
+                    ))
+                })?;
 
-    let body = resp.text()?;
-    let mut reader = Reader::from_str(&body);
-    reader.trim_text(true);
+        // inspecting each XML element we populate our releases list
+        let mut buf = Vec::new();
+        let mut releases: Vec<Release> = vec![];
+        
+        loop {
+            match reader.read_event(&mut buf) {
+                Ok(Event::Start(ref e)) => match e.name() {
+                    b"NextContinuationToken" => {
+                        current_tag = Tag::NextContinuationToken;
+                    }
+                    b"Contents" => {
+                        current_tag = Tag::Contents;
+                        if let Some(release) = current_release {
+                            add_to_releases_list(&mut releases, release);
+                        }
+                        current_release = None;
+                    }
+                    b"Key" => current_tag = Tag::Key,
+                    b"LastModified" => current_tag = Tag::LastModified,
+                    _ => current_tag = Tag::Other,
+                },
+                Ok(Event::Text(e)) => {
+                    // if we cannot decode a tag text we just ignore it
+                    if let Ok(txt) = e.unescape_and_decode(&reader) {
+                        match current_tag {
+                            Tag::Key => {
+                                let p = PathBuf::from(&txt);
+                                let exe_name = match p.file_name().map(|v| v.to_str()) {
+                                    Some(Some(v)) => v,
+                                    _ => &txt,
+                                };
+                                // println!("ext_name: {:?}", exe_name);
 
-    // Let's now parse the response to extract the releases
-    enum Tag {
-        Contents,
-        Key,
-        LastModified,
-        Other,
-    }
-
-    let mut current_tag = Tag::Other;
-    let mut current_release: Option<Release> = None;
-    let regex =
-        Regex::new(r"(?i)(?P<prefix>.*/)*(?P<name>.+)-[v]{0,1}(?P<version>\d+\.\d+\.\d+)-.+")
-            .map_err(|err| {
-                Error::Release(format!(
-                    "Failed constructing regex to parse S3 filenames: {}",
-                    err
-                ))
-            })?;
-
-    // inspecting each XML element we populate our releases list
-    let mut buf = Vec::new();
-    let mut releases: Vec<Release> = vec![];
-    loop {
-        match reader.read_event(&mut buf) {
-            Ok(Event::Start(ref e)) => match e.name() {
-                b"Contents" => {
-                    current_tag = Tag::Contents;
+                                if let Some(captures) = regex.captures(&txt) {
+                                    let release = current_release.get_or_insert(Release::default());
+                                    release.name = captures["name"].to_string();
+                                    release.version =
+                                        captures["version"].trim_start_matches('v').to_string();
+                                    release.assets = vec![ReleaseAsset {
+                                        name: exe_name.to_string(),
+                                        download_url: format!("{}{}", download_base_url, txt),
+                                    }];
+                                    debug!("Matched release: {:?}", release);
+                                } else {
+                                    debug!("Regex mismatch: {:?}", &txt);
+                                }
+                            }
+                            Tag::LastModified => {
+                                let release = current_release.get_or_insert(Release::default());
+                                release.date = txt;
+                            }
+                            Tag::NextContinuationToken => {
+                                next_token = Some(txt);
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+                Ok(Event::Eof) => {
                     if let Some(release) = current_release {
                         add_to_releases_list(&mut releases, release);
                     }
-                    current_release = None;
+                    break; // exits the loop when reaching end of file
                 }
-                b"Key" => current_tag = Tag::Key,
-                b"LastModified" => current_tag = Tag::LastModified,
-                _ => current_tag = Tag::Other,
-            },
-            Ok(Event::Text(e)) => {
-                // if we cannot decode a tag text we just ignore it
-                if let Ok(txt) = e.unescape_and_decode(&reader) {
-                    match current_tag {
-                        Tag::Key => {
-                            let p = PathBuf::from(&txt);
-                            let exe_name = match p.file_name().map(|v| v.to_str()) {
-                                Some(Some(v)) => v,
-                                _ => &txt,
-                            };
+                Err(e) => bail!(
+                    Error::Release,
+                    "Failed when parsing S3 XML response at position {}: {:?}",
+                    reader.buffer_position(),
+                    e
+                ),
+                _ => (), // There are several other `Event`s we ignore here
+            }
 
-                            if let Some(captures) = regex.captures(&txt) {
-                                let release = current_release.get_or_insert(Release::default());
-                                release.name = captures["name"].to_string();
-                                release.version =
-                                    captures["version"].trim_start_matches('v').to_string();
-                                release.assets = vec![ReleaseAsset {
-                                    name: exe_name.to_string(),
-                                    download_url: format!("{}{}", download_base_url, txt),
-                                }];
-                                debug!("Matched release: {:?}", release);
-                            } else {
-                                debug!("Regex mismatch: {:?}", &txt);
-                            }
-                        }
-                        Tag::LastModified => {
-                            let release = current_release.get_or_insert(Release::default());
-                            release.date = txt;
-                        }
-                        _ => (),
-                    }
-                }
-            }
-            Ok(Event::Eof) => {
-                if let Some(release) = current_release {
-                    add_to_releases_list(&mut releases, release);
-                }
-                break; // exits the loop when reaching end of file
-            }
-            Err(e) => bail!(
-                Error::Release,
-                "Failed when parsing S3 XML response at position {}: {:?}",
-                reader.buffer_position(),
-                e
-            ),
-            _ => (), // There are several other `Event`s we ignore here
+            buf.clear();
         }
-
-        buf.clear();
+        all_releases.append(&mut releases);
     }
 
-    Ok(releases)
+    Ok(all_releases)
 }
 
 // Add a release to the list if it's doesn't exist yet, or merge its asset/s
@@ -682,11 +699,14 @@ fn add_to_releases_list(releases: &mut Vec<Release>, mut rel: Release) {
             .position(|curr| curr.name == rel.name && curr.version == rel.version)
         {
             Some(index) => {
+                // println!("same value: {:?}, {:?}", rel, curr);
                 rel.assets.append(&mut releases[index].assets);
                 releases.push(rel);
                 releases.swap_remove(index);
             }
             None => releases.push(rel),
         }
+    } else {
+        println!("Release is empty: {:?}", rel);
     }
 }
